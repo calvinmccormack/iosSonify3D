@@ -204,6 +204,32 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
             speak("Faster"); print("[Voice] → faster"); return
         }
 
+        // "target 2 [object]" or "target two [object]"
+        let t2Patterns = ["target 2 ", "target two ", "target to "]
+        for pat in t2Patterns {
+            if let range = text.range(of: pat) {
+                let after = String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let objName = extractObjectName(after)
+                let cmdKey = "target2:\(objName)"
+                if !objName.isEmpty && !executedCommands.contains(cmdKey) {
+                    if let resolved = resolveCocoClass(objName) {
+                        executedCommands.insert(cmdKey)
+                        // Add as second target
+                        if activeClasses.count < 2 {
+                            activeClasses.append((name: resolved.name, classId: resolved.id))
+                        } else {
+                            activeClasses[1] = (name: resolved.name, classId: resolved.id)
+                        }
+                        notifyClassChange()
+                        speak("Target 2 \(resolved.name)")
+                        statusText = "Finding: " + activeClasses.map { $0.name }.joined(separator: " + ")
+                        print("[Voice] → target 2 \(resolved.name) (id \(resolved.id))")
+                    }
+                }
+                return
+            }
+        }
+
         // "find [object]"
         if let range = text.range(of: "find ") {
             let after = String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)

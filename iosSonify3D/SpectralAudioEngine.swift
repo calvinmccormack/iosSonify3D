@@ -184,11 +184,11 @@ final class SpectralAudioEngine: ObservableObject {
     }
 
     func clearTarget() {
-        // Only decay the spectral boost bands for empty columns.
-        // Do NOT touch comb target levels here — the comb should sustain
-        // as long as there are active detections somewhere in the scene.
-        // Comb levels are only zeroed when activeClasses is cleared.
+        // Slowly decay the spectral boost bands for empty columns
         for i in 0..<numBands { targetBoostBands[i] *= targetBoostSmooth }
+        // Slowly decay comb levels — will re-pump to 1.0 when sweep hits object again
+        class1TargetLevel *= 0.95
+        class2TargetLevel *= 0.95
     }
 
     /// Call this when the user clears all targets (no active classes).
