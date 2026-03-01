@@ -2,21 +2,39 @@ import Foundation
 import AVFoundation
 import Combine
 
-/// Pure FM synthesis engine — no background noise layer.
-/// Two FM voices for up to 2 simultaneous object classes.
-/// All spatial parameters driven by the sweep snapshot.
+/// Pure FM synthesis engine with up to 4 target voices + scan drone.
+///
+/// Design:
+/// - Each voice's timbre (C:M ratio) is fixed per SLOT, not per class.
+///   Slot 1–4 have maximally distinct timbres.
+/// - Y centroid → carrier frequency (consistent across all slots).
+/// - Z depth   → amplitude (near = loud, far = quiet).
+/// - Coverage  → modulation index β (tall column slice = bright/rich,
+///   thin slice = pure). This conveys object height per column.
+/// - Pan       → stereo position from sweep X.
+/// - A low triangle-wave drone pans with the sweep to indicate scan
+///   position, start, and end.
 final class SpectralAudioEngine: ObservableObject {
 
-    @Published var pan: Float = 0
     @Published var outputGainDB: Float = 6.0
 
     private let sampleRate: Double
     private let engine = AVAudioEngine()
     private var srcNode: AVAudioSourceNode!
 
+    // ─── Slot timbres: maximally distinct C:M ratios ───
+    // ALL ratios >= 1.0 so the carrier always determines perceived pitch.
+    // The modulator colors the spectrum ABOVE the carrier fundamental.
+    // Slot 0: 1:1   → all harmonics (warm, brass-like)
+    // Slot 1: 1:2   → odd harmonics (hollow, clarinet-like)
+    // Slot 2: 1:3   → every-3rd harmonic (bell-like, bright)
+    // Slot 3: 1:1.5 → perfect-fifth harmonics (nasal, distinct)
+    static let slotCMRatios: [Float] = [1.0, 2.0, 3.0, 1.5]
+
     // ─── FM Voices ───
     struct FMVoice {
-        var classId: Int = -1
+        var slot: Int = -1       // 0-3
+        var classId: Int = -1    // which COCO class is assigned (for display only)
         var active: Bool = false
         var level: Float = 0
         var targetLevel: Float = 0
@@ -25,37 +43,58 @@ final class SpectralAudioEngine: ObservableObject {
         var carrierPhase: Float = 0
         var modPhase: Float = 0
 
-        var carrierFreq: Float = 220
-        var targetCarrierFreq: Float = 220
-        var modIndex: Float = 2.0
-        var targetModIndex: Float = 2.0
-        var ampEnvelope: Float = 0
-        var targetAmpEnvelope: Float = 0
+        // Spatial params (smoothed)
+        var carrierFreq: Float = 300
+        var targetCarrierFreq: Float = 300
+        var modIndex: Float = 1.0      // driven by COVERAGE (object height)
+        var targetModIndex: Float = 1.0
+        var amplitude: Float = 0       // driven by DEPTH (nearness)
+        var targetAmplitude: Float = 0
 
         mutating func reset() {
-            classId = -1; active = false; level = 0; targetLevel = 0
+            slot = -1; classId = -1; active = false
+            level = 0; targetLevel = 0
             carrierPhase = 0; modPhase = 0
-            carrierFreq = 220; targetCarrierFreq = 220
-            modIndex = 2.0; targetModIndex = 2.0
-            ampEnvelope = 0; targetAmpEnvelope = 0
+            carrierFreq = 300; targetCarrierFreq = 300
+            modIndex = 1.0; targetModIndex = 1.0
+            amplitude = 0; targetAmplitude = 0
         }
     }
 
-    private var fm1 = FMVoice()
-    private var fm2 = FMVoice()
-    private let levelRamp: Float = 0.93
-    private let paramRamp: Float = 0.85
+    private var voices: [FMVoice] = (0..<4).map { _ in FMVoice() }
+    private let levelRamp: Float = 0.92
+    private let paramRamp: Float = 0.82
 
-    // Smoothed pan
-    private var currentPan: Float = 0
-    private var targetPan: Float = 0
+    // ─── Consistent Y → pitch mapping ───
+    // centroid 0 (bottom) → 120 Hz, centroid 1 (top) → 800 Hz
+    // Log scale for perceptual linearity
+    private let pitchMinHz: Float = 120
+    private let pitchMaxHz: Float = 800
+
+    // ─── Coverage → modulation index mapping ───
+    // coverage 0 → β = 0.3 (pure tone), coverage 1 → β = 6.0 (very bright)
+    private let betaMin: Float = 0.3
+    private let betaMax: Float = 6.0
+
+    // ─── Scan drone ───
+    private var dronePhase: Float = 0
+    private let droneFreq: Float = 90          // Hz — low but audible on bone conduction
+    private let droneAmplitude: Float = 0.06   // subtle
+    private var droneActive: Bool = false
+    private var dronePan: Float = 0            // follows sweep
+    private var droneTargetPan: Float = 0
+    private var droneLevel: Float = 0          // for fade in/out
+    private var droneTargetLevel: Float = 0
+
+    // ─── Smoothed output pan per voice ───
+    private var voicePan: [Float] = [0, 0, 0, 0]
+    private var voiceTargetPan: [Float] = [0, 0, 0, 0]
 
     init() {
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playAndRecord, mode: .default,
                                  options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
         try? session.setActive(true)
-
         self.sampleRate = session.sampleRate
 
         let fmt = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
@@ -64,7 +103,7 @@ final class SpectralAudioEngine: ObservableObject {
             let abl = UnsafeMutableAudioBufferListPointer(buf)
             guard let left = abl[0].mData?.assumingMemoryBound(to: Float.self),
                   let right = abl[1].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
-            self.renderFM(left: left, right: right, count: Int(frameCount))
+            self.render(left: left, right: right, count: Int(frameCount))
             return noErr
         }
         engine.attach(srcNode)
@@ -74,195 +113,179 @@ final class SpectralAudioEngine: ObservableObject {
     func start() { if !engine.isRunning { try? engine.start() } }
     func stop() { engine.stop() }
 
+    // MARK: - Scan lifecycle
+
+    func beginScan() {
+        droneActive = true
+        droneTargetLevel = 1.0
+        print("[Audio] beginScan — drone on, engine running: \(engine.isRunning)")
+        // Ensure engine is running (TTS may have interrupted it)
+        if !engine.isRunning { try? engine.start() }
+    }
+
+    func endScan() {
+        droneTargetLevel = 0
+        for i in 0..<4 {
+            voices[i].targetLevel = 0
+            voices[i].targetAmplitude = 0
+        }
+    }
+
     // MARK: - Target routing
 
-    /// Called by sweep for each column that has a detected object.
-    func setTarget(classId: Int, centroid: Float, coverage: Float, depth: Float, pan: Float) {
-        targetPan = pan
+    /// Called per sweep column when target object is detected.
+    /// `slot`: 0-3, which target slot this class is assigned to.
+    func setTarget(slot: Int, centroid: Float, coverage: Float, depth: Float, pan: Float) {
+        guard slot >= 0 && slot < 4 else { return }
 
-        if classId == fm1.classId || (fm1.classId == -1 && classId != fm2.classId) {
-            configureFMVoice(&fm1, classId: classId, centroid: centroid,
-                             coverage: coverage, depth: depth)
-            fm1.targetLevel = 1.0
-        } else if classId == fm2.classId || fm2.classId == -1 {
-            configureFMVoice(&fm2, classId: classId, centroid: centroid,
-                             coverage: coverage, depth: depth)
-            fm2.targetLevel = 1.0
-        } else {
-            configureFMVoice(&fm1, classId: classId, centroid: centroid,
-                             coverage: coverage, depth: depth)
-            fm1.targetLevel = 1.0
+        // Y centroid → carrier frequency (log scale)
+        let logMin = log2(pitchMinHz)
+        let logMax = log2(pitchMaxHz)
+        let freq = powf(2.0, logMin + centroid * (logMax - logMin))
+        voices[slot].targetCarrierFreq = freq
+
+        // Coverage → modulation index (object height → brightness)
+        let beta = betaMin + min(1.0, coverage * 2.0) * (betaMax - betaMin)
+        voices[slot].targetModIndex = beta
+
+        // Depth → amplitude (near = loud, far = quiet)
+        let nearness = max(0, min(1, 1.0 - depth))
+        voices[slot].targetAmplitude = 0.2 + nearness * 0.8
+
+        voices[slot].targetLevel = 1.0
+        voiceTargetPan[slot] = pan
+
+        // Ensure voice is configured
+        if !voices[slot].active {
+            voices[slot].active = true
+            voices[slot].cmRatio = Self.slotCMRatios[slot]
+            voices[slot].slot = slot
+            print("[Audio] Activated slot \(slot) cm=\(voices[slot].cmRatio) fc=\(Int(freq))Hz β=\(String(format:"%.1f",beta)) amp=\(String(format:"%.2f",voices[slot].targetAmplitude))")
+        }
+
+        // Update drone pan to follow sweep
+        droneTargetPan = pan
+    }
+
+    /// Called for columns with no target — decay voices.
+    func clearColumn(pan: Float) {
+        droneTargetPan = pan
+        for i in 0..<4 {
+            voices[i].targetLevel *= 0.90
+            voices[i].targetAmplitude *= 0.85
         }
     }
 
-    /// Called for columns with no target detection — decay FM.
-    func clearTarget(pan: Float) {
-        targetPan = pan
-        fm1.targetLevel *= 0.92
-        fm2.targetLevel *= 0.92
-        fm1.targetAmpEnvelope *= 0.88
-        fm2.targetAmpEnvelope *= 0.88
+    /// Assign a class to a slot (called when user picks target).
+    func assignSlot(_ slot: Int, classId: Int) {
+        guard slot >= 0 && slot < 4 else { return }
+        voices[slot].slot = slot
+        voices[slot].classId = classId
+        voices[slot].cmRatio = Self.slotCMRatios[slot]
+        voices[slot].active = true
     }
 
-    /// Called when user clears all targets.
+    /// Deactivate all voices.
     func deactivateAll() {
-        fm1.reset(); fm2.reset()
-    }
-
-    /// Called when scan finishes — let FM ring out then silence.
-    func endScan() {
-        fm1.targetLevel = 0
-        fm2.targetLevel = 0
-        fm1.targetAmpEnvelope = 0
-        fm2.targetAmpEnvelope = 0
-    }
-
-    // MARK: - FM Configuration
-
-    private static func cmRatioForClass(_ classId: Int) -> Float {
-        switch classId {
-        case 0:       return 1.0     // person — warm brass
-        case 1...8:   return 2.01    // vehicles — bright metallic
-        case 9...13:  return 1.5     // outdoor — mellow reed
-        case 14...23: return 3.0     // animals — bell
-        case 24...28: return 2.5     // accessories — hollow/woody
-        case 29...38: return 1.414   // sports — bright string
-        case 39...45: return 3.5     // kitchen — chime
-        case 46...55: return 2.0     // food — clarinet
-        case 56...61: return 1.33    // furniture — organ
-        case 62...67: return 3.01    // electronics — shimmer
-        case 68...72: return 2.5     // appliances — hollow
-        case 73...79: return 4.0     // misc — complex bell
-        default:      return 1.0
-        }
-    }
-
-    private static func baseFreqForClass(_ classId: Int) -> Float {
-        let phi: Float = 1.618034
-        let hash = fmod(Float(classId) * phi, 1.0)
-        return powf(2.0, log2(110.0) + hash * (log2(440.0) - log2(110.0)))
-    }
-
-    private func configureFMVoice(_ voice: inout FMVoice, classId: Int,
-                                   centroid: Float, coverage: Float, depth: Float) {
-        if voice.classId != classId {
-            voice.classId = classId
-            voice.active = true
-            voice.cmRatio = Self.cmRatioForClass(classId)
-        }
-        if !voice.active { voice.active = true }
-
-        let baseFreq = Self.baseFreqForClass(classId)
-        let centroidShift = powf(2.0, (centroid - 0.5) * 2.0)
-        voice.targetCarrierFreq = baseFreq * centroidShift
-
-        let nearness = 1.0 - depth
-        voice.targetModIndex = 0.5 + nearness * 5.0
-
-        voice.targetAmpEnvelope = min(1.0, coverage * 2.0)
+        for i in 0..<4 { voices[i].reset() }
+        droneActive = false; droneLevel = 0; droneTargetLevel = 0
     }
 
     // MARK: - Render
 
-    private func renderFM(left: UnsafeMutablePointer<Float>,
-                           right: UnsafeMutablePointer<Float>, count: Int) {
+    private func render(left: UnsafeMutablePointer<Float>,
+                         right: UnsafeMutablePointer<Float>, count: Int) {
         let sr = Float(sampleRate)
         let twoPi = Float.pi * 2.0
         let gain = powf(10.0, outputGainDB / 20.0)
 
-        // Per-block param smoothing (cheaper than per-sample)
-        fm1.level = levelRamp * fm1.level + (1 - levelRamp) * fm1.targetLevel
-        fm2.level = levelRamp * fm2.level + (1 - levelRamp) * fm2.targetLevel
-        fm1.carrierFreq = paramRamp * fm1.carrierFreq + (1 - paramRamp) * fm1.targetCarrierFreq
-        fm1.modIndex    = paramRamp * fm1.modIndex    + (1 - paramRamp) * fm1.targetModIndex
-        fm1.ampEnvelope = paramRamp * fm1.ampEnvelope + (1 - paramRamp) * fm1.targetAmpEnvelope
-        fm2.carrierFreq = paramRamp * fm2.carrierFreq + (1 - paramRamp) * fm2.targetCarrierFreq
-        fm2.modIndex    = paramRamp * fm2.modIndex    + (1 - paramRamp) * fm2.targetModIndex
-        fm2.ampEnvelope = paramRamp * fm2.ampEnvelope + (1 - paramRamp) * fm2.targetAmpEnvelope
+        // Per-block param smoothing
+        for i in 0..<4 {
+            voices[i].level       = levelRamp * voices[i].level       + (1 - levelRamp) * voices[i].targetLevel
+            voices[i].carrierFreq = paramRamp * voices[i].carrierFreq + (1 - paramRamp) * voices[i].targetCarrierFreq
+            voices[i].modIndex    = paramRamp * voices[i].modIndex    + (1 - paramRamp) * voices[i].targetModIndex
+            voices[i].amplitude   = paramRamp * voices[i].amplitude   + (1 - paramRamp) * voices[i].targetAmplitude
+            voicePan[i] += (voiceTargetPan[i] - voicePan[i]) * 0.15
 
-        if fm1.active && fm1.targetLevel < 0.001 && fm1.level < 0.001 { fm1.reset() }
-        if fm2.active && fm2.targetLevel < 0.001 && fm2.level < 0.001 { fm2.reset() }
-
-        // Smooth pan per-block
-        currentPan += (targetPan - currentPan) * 0.15
-
-        let theta = (-currentPan + 1) * Float.pi * 0.25
-        let gL = sin(theta), gR = cos(theta)
-
-        let hasAny = (fm1.active && fm1.level > 0.003) || (fm2.active && fm2.level > 0.003)
-
-        for i in 0..<count {
-            var sample: Float = 0
-
-            if hasAny {
-                if fm1.active && fm1.level > 0.003 && fm1.classId >= 0 {
-                    let fc = fm1.carrierFreq
-                    let fmFreq = fc * fm1.cmRatio
-                    let modSig = sinf(fm1.modPhase)
-                    let out = sinf(fm1.carrierPhase + fm1.modIndex * modSig)
-                    sample += out * fm1.level * fm1.ampEnvelope * 0.4
-
-                    fm1.carrierPhase += twoPi * fc / sr
-                    fm1.modPhase += twoPi * fmFreq / sr
-                    if fm1.carrierPhase > twoPi { fm1.carrierPhase -= twoPi }
-                    if fm1.modPhase > twoPi { fm1.modPhase -= twoPi }
-                }
-
-                if fm2.active && fm2.level > 0.003 && fm2.classId >= 0 {
-                    let fc = fm2.carrierFreq
-                    let fmFreq = fc * fm2.cmRatio
-                    let modSig = sinf(fm2.modPhase)
-                    let out = sinf(fm2.carrierPhase + fm2.modIndex * modSig)
-                    sample += out * fm2.level * fm2.ampEnvelope * 0.4
-
-                    fm2.carrierPhase += twoPi * fc / sr
-                    fm2.modPhase += twoPi * fmFreq / sr
-                    if fm2.carrierPhase > twoPi { fm2.carrierPhase -= twoPi }
-                    if fm2.modPhase > twoPi { fm2.modPhase -= twoPi }
-                }
+            if voices[i].active && voices[i].targetLevel < 0.001 && voices[i].level < 0.001 {
+                voices[i].reset()
             }
-
-            // Apply gain + soft clip
-            sample *= gain
-            if sample > 0.95 { sample = 0.95 }
-            else if sample < -0.95 { sample = -0.95 }
-
-            left[i] = sample * gL
-            right[i] = sample * gR
         }
 
-        // Debug logging
-        struct FMDbg { static var lastLog: Double = 0 }
+        // Drone smoothing
+        droneLevel += (droneTargetLevel - droneLevel) * 0.05
+        dronePan += (droneTargetPan - dronePan) * 0.15
+        if droneLevel < 0.001 && droneTargetLevel < 0.001 { droneActive = false }
+
+        for s in 0..<count {
+            var sampleL: Float = 0
+            var sampleR: Float = 0
+
+            // FM voices
+            for i in 0..<4 {
+                guard voices[i].active && voices[i].level > 0.003 else { continue }
+
+                let fc = voices[i].carrierFreq
+                let fmFreq = fc * voices[i].cmRatio
+                let beta = voices[i].modIndex
+
+                let modSig = sinf(voices[i].modPhase)
+                let out = sinf(voices[i].carrierPhase + beta * modSig)
+                let amp = out * voices[i].level * voices[i].amplitude * 0.35
+
+                // Per-voice pan
+                let theta = (-voicePan[i] + 1) * Float.pi * 0.25
+                sampleL += amp * sin(theta)
+                sampleR += amp * cos(theta)
+
+                voices[i].carrierPhase += twoPi * fc / sr
+                voices[i].modPhase += twoPi * fmFreq / sr
+                if voices[i].carrierPhase > twoPi { voices[i].carrierPhase -= twoPi }
+                if voices[i].modPhase > twoPi { voices[i].modPhase -= twoPi }
+            }
+
+            // Scan drone (triangle wave)
+            if droneActive || droneLevel > 0.001 {
+                // Triangle wave: 4 * |phase/2π - 0.5| - 1
+                let normPhase = dronePhase / twoPi
+                let tri = 4.0 * abs(normPhase - 0.5) - 1.0
+                let droneSig = tri * droneAmplitude * droneLevel
+
+                let dTheta = (-dronePan + 1) * Float.pi * 0.25
+                sampleL += droneSig * sin(dTheta)
+                sampleR += droneSig * cos(dTheta)
+
+                dronePhase += twoPi * droneFreq / sr
+                if dronePhase > twoPi { dronePhase -= twoPi }
+            }
+
+            // Gain + soft clip
+            sampleL *= gain; sampleR *= gain
+            sampleL = max(-0.95, min(0.95, sampleL))
+            sampleR = max(-0.95, min(0.95, sampleR))
+
+            left[s] = sampleL
+            right[s] = sampleR
+        }
+
+        // Debug
+        struct Dbg { static var t: Double = 0 }
         let now = CACurrentMediaTime()
-        if now - FMDbg.lastLog > 2.0 && hasAny {
-            FMDbg.lastLog = now
-            if fm1.active {
-                print("[FM] v1: \(cocoName(fm1.classId)) fc=\(Int(fm1.carrierFreq))Hz cm=\(String(format:"%.2f",fm1.cmRatio)) β=\(String(format:"%.1f",fm1.modIndex)) amp=\(String(format:"%.2f",fm1.ampEnvelope)) lvl=\(String(format:"%.2f",fm1.level))")
-            }
-            if fm2.active {
-                print("[FM] v2: \(cocoName(fm2.classId)) fc=\(Int(fm2.carrierFreq))Hz cm=\(String(format:"%.2f",fm2.cmRatio)) β=\(String(format:"%.1f",fm2.modIndex)) amp=\(String(format:"%.2f",fm2.ampEnvelope)) lvl=\(String(format:"%.2f",fm2.level))")
+        if now - Dbg.t > 0.5 {
+            Dbg.t = now
+            let anyActive = voices.contains { $0.active && $0.level > 0.01 }
+            if anyActive || droneLevel > 0.01 {
+                var parts: [String] = []
+                for i in 0..<4 where voices[i].active {
+                    parts.append("s\(i):fc=\(Int(voices[i].carrierFreq)) β=\(String(format:"%.1f",voices[i].modIndex)) amp=\(String(format:"%.2f",voices[i].amplitude)) lvl=\(String(format:"%.2f",voices[i].level))")
+                }
+                if droneLevel > 0.01 { parts.append("drone=\(String(format:"%.2f",droneLevel))") }
+                print("[FM] \(parts.joined(separator: " | "))")
             }
         }
     }
 
-    private func cocoName(_ id: Int) -> String {
-        let n = ["person","bicycle","car","motorcycle","airplane","bus","train",
-                 "truck","boat","traffic light","fire hydrant","stop sign",
-                 "parking meter","bench","bird","cat","dog","horse","sheep","cow",
-                 "elephant","bear","zebra","giraffe","backpack","umbrella","handbag",
-                 "tie","suitcase","frisbee","skis","snowboard","sports ball","kite",
-                 "baseball bat","baseball glove","skateboard","surfboard",
-                 "tennis racket","bottle","wine glass","cup","fork","knife","spoon",
-                 "bowl","banana","apple","sandwich","orange","broccoli","carrot",
-                 "hot dog","pizza","donut","cake","chair","couch","potted plant",
-                 "bed","dining table","toilet","tv","laptop","mouse","remote",
-                 "keyboard","cell phone","microwave","oven","toaster","sink",
-                 "refrigerator","book","clock","vase","scissors","teddy bear",
-                 "hair drier","toothbrush"]
-        return id >= 0 && id < n.count ? n[id] : "?\(id)"
-    }
-
-    // MARK: - Stubs for API compat (no-ops, kept so callers compile)
+    // MARK: - Stubs for API compat
     func configureBands(fMin: Double, fMax: Double) {}
     func updateEnvelope(_ env: [Float]) {}
     func updateDistance(_ z: Float) {}

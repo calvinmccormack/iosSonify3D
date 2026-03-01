@@ -1,7 +1,6 @@
 import SwiftUI
 import ARKit
 
-/// Sorted COCO class list for display
 private let sortedCocoClasses: [(name: String, id: Int)] = {
     cocoClasses.sorted { $0.key < $1.key }.map { (name: $0.key, id: $0.value) }
 }()
@@ -14,13 +13,13 @@ struct ContentView: View {
     @State private var sweepSeconds: Double = 2.0
     @State private var confidence: Double = 0.25
 
-    // Class selections: -1 = none
-    @State private var class1Selection: Int = -1
-    @State private var class2Selection: Int = -1
+    // 4 target slots, -1 = none
+    @State private var slotSelections: [Int] = [-1, -1, -1, -1]
+    @State private var showingPickerFor: Int? = nil
 
-    // Sheet presentation
-    @State private var showingPicker1 = false
-    @State private var showingPicker2 = false
+    // Slot colors for visual distinction
+    private let slotColors: [Color] = [.red, .blue, .green, .orange]
+    private let slotLabels = ["① Brass", "② Hollow", "③ Bell", "④ Nasal"]
 
     var body: some View {
         GeometryReader { geo in
@@ -62,27 +61,25 @@ struct ContentView: View {
                     }
                     .padding(8)
                 }
-                .frame(width: geo.size.width * 0.55, height: geo.size.height)
+                .frame(width: geo.size.width * 0.50, height: geo.size.height)
                 .clipped()
 
                 // RIGHT: Controls
                 ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 6) {
 
-                        // Scan button + Mic
+                        // Scan + Mic
                         HStack {
                             Button {
-                                if depthPipeline.isScanning {
-                                    cancelScan()
-                                } else {
-                                    triggerScan()
-                                }
+                                if depthPipeline.isScanning { cancelScan() }
+                                else { triggerScan() }
                             } label: {
-                                HStack(spacing: 6) {
+                                HStack(spacing: 5) {
                                     Image(systemName: depthPipeline.isScanning
                                           ? "stop.fill" : "waveform.circle.fill")
                                     Text(depthPipeline.isScanning ? "Stop" : "Scan")
                                 }
+                                .font(.callout)
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(depthPipeline.isScanning ? .red : .blue)
@@ -90,67 +87,49 @@ struct ContentView: View {
                             Spacer()
 
                             Button {
-                                if voiceManager.isListening {
-                                    voiceManager.stopListening()
-                                } else {
-                                    voiceManager.startListening()
-                                }
+                                if voiceManager.isListening { voiceManager.stopListening() }
+                                else { voiceManager.startListening() }
                             } label: {
                                 Image(systemName: voiceManager.isListening
                                       ? "mic.fill" : "mic.slash")
-                                    .font(.title2)
+                                    .font(.title3)
                                     .foregroundColor(voiceManager.isListening ? .red : .secondary)
                             }
                         }
 
                         if voiceManager.isListening {
                             Text(voiceManager.statusText)
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
+                                .font(.caption2).foregroundColor(.secondary)
                         }
 
                         Divider()
 
-                        // Target selection
-                        Text("Target Objects").font(.caption).bold()
+                        // 4 target slots
+                        Text("Targets").font(.caption).bold()
 
-                        Button { showingPicker1 = true } label: {
-                            HStack {
-                                if class1Selection >= 0 {
-                                    Circle().fill(colorForClass(class1Selection))
-                                        .frame(width: 10, height: 10)
-                                    Text(className(for: class1Selection))
-                                } else {
-                                    Text("Target 1: None").foregroundColor(.secondary)
+                        ForEach(0..<4, id: \.self) { slot in
+                            Button { showingPickerFor = slot } label: {
+                                HStack(spacing: 6) {
+                                    Circle().fill(slotColors[slot])
+                                        .frame(width: 8, height: 8)
+                                    if slotSelections[slot] >= 0 {
+                                        Text("\(slot+1): \(className(for: slotSelections[slot]))")
+                                    } else {
+                                        Text("\(slotLabels[slot]): —")
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .foregroundColor(.secondary)
+                                        .font(.caption2)
                                 }
-                                Spacer()
-                                Image(systemName: "chevron.right").foregroundColor(.secondary)
+                                .font(.caption)
+                                .padding(5)
+                                .background(Color(.systemGray6))
+                                .cornerRadius(5)
                             }
-                            .font(.caption)
-                            .padding(6)
-                            .background(Color(.systemGray6))
-                            .cornerRadius(6)
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
-
-                        Button { showingPicker2 = true } label: {
-                            HStack {
-                                if class2Selection >= 0 {
-                                    Circle().fill(colorForClass(class2Selection))
-                                        .frame(width: 10, height: 10)
-                                    Text(className(for: class2Selection))
-                                } else {
-                                    Text("Target 2: None").foregroundColor(.secondary)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.right").foregroundColor(.secondary)
-                            }
-                            .font(.caption)
-                            .padding(6)
-                            .background(Color(.systemGray6))
-                            .cornerRadius(6)
-                        }
-                        .buttonStyle(.plain)
 
                         Divider()
 
@@ -163,14 +142,13 @@ struct ContentView: View {
                         LabeledSlider(title: "Sweep", value: $sweepSeconds,
                                       range: 0.5...8.0, format: "%.1fs")
 
-                        Spacer(minLength: 4)
+                        Spacer(minLength: 2)
 
                         Text(String(format: "%.0f FPS", depthPipeline.fps))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
-                .frame(width: geo.size.width * 0.45 - 24, height: geo.size.height)
+                .frame(width: geo.size.width * 0.50 - 24, height: geo.size.height)
             }
             .padding(12)
         }
@@ -183,13 +161,11 @@ struct ContentView: View {
             setupVoiceCallbacks()
             voiceManager.requestPermissions { _ in }
         }
-        .sheet(isPresented: $showingPicker1) {
-            ClassPickerSheet(selection: $class1Selection, title: "Target 1") {
-                updateActiveClasses()
-            }
-        }
-        .sheet(isPresented: $showingPicker2) {
-            ClassPickerSheet(selection: $class2Selection, title: "Target 2") {
+        .sheet(item: $showingPickerFor) { slot in
+            ClassPickerSheet(selection: Binding(
+                get: { slotSelections[slot] },
+                set: { slotSelections[slot] = $0 }
+            ), title: slotLabels[slot]) {
                 updateActiveClasses()
             }
         }
@@ -199,14 +175,17 @@ struct ContentView: View {
 
     private func triggerScan() {
         guard !depthPipeline.isScanning else { return }
+        audio.beginScan()
 
         depthPipeline.triggerScan(sweepSeconds: sweepSeconds,
-            onColumn: { col, classId, centroid, coverage, z01, pan in
-                if classId >= 0 {
-                    self.audio.setTarget(classId: classId, centroid: centroid,
-                                         coverage: coverage, depth: z01, pan: pan)
+            onColumn: { col, hits, z01, pan in
+                if hits.isEmpty {
+                    self.audio.clearColumn(pan: pan)
                 } else {
-                    self.audio.clearTarget(pan: pan)
+                    for hit in hits {
+                        self.audio.setTarget(slot: hit.slot, centroid: hit.centroid,
+                                             coverage: hit.coverage, depth: z01, pan: pan)
+                    }
                 }
             },
             onComplete: {
@@ -220,26 +199,40 @@ struct ContentView: View {
         audio.endScan()
     }
 
-    // MARK: - Class management
+    // MARK: - Slot management
 
     private func updateActiveClasses() {
-        var ids: [Int] = []
-        if class1Selection >= 0 { ids.append(class1Selection) }
-        if class2Selection >= 0 && class2Selection != class1Selection {
-            ids.append(class2Selection)
+        // Build classId → slot map
+        var slotMap: [Int: Int] = [:]
+        for slot in 0..<4 {
+            let cid = slotSelections[slot]
+            if cid >= 0 { slotMap[cid] = slot }
         }
-        depthPipeline.setActiveClasses(ids)
-        if ids.isEmpty { audio.deactivateAll() }
+        depthPipeline.setActiveClasses(slotMap)
+
+        // Configure audio voice slots
+        for slot in 0..<4 {
+            let cid = slotSelections[slot]
+            if cid >= 0 {
+                audio.assignSlot(slot, classId: cid)
+            }
+        }
+        if slotMap.isEmpty { audio.deactivateAll() }
     }
 
     private func setupVoiceCallbacks() {
-        voiceManager.onClassesChanged = { classIds in
+        voiceManager.onSlotChanged = { slot, classId in
+            guard slot >= 0 && slot < 4 else { return }
             DispatchQueue.main.async {
-                self.class1Selection = classIds.count > 0 ? classIds[0] : -1
-                self.class2Selection = classIds.count > 1 ? classIds[1] : -1
+                self.slotSelections[slot] = classId
+                self.updateActiveClasses()
             }
-            self.depthPipeline.setActiveClasses(classIds)
-            if classIds.isEmpty { self.audio.deactivateAll() }
+        }
+        voiceManager.onClearAll = {
+            DispatchQueue.main.async {
+                self.slotSelections = [-1, -1, -1, -1]
+                self.updateActiveClasses()
+            }
         }
         voiceManager.onSweepRateChanged = { multiplier in
             self.sweepSeconds = 2.0 * Double(multiplier)
@@ -249,13 +242,14 @@ struct ContentView: View {
         }
     }
 
-    private func colorForClass(_ classId: Int) -> Color {
-        Color(hue: Double(classId * 37 % 360) / 360.0, saturation: 0.8, brightness: 0.9)
-    }
-
     private func className(for id: Int) -> String {
         cocoClasses.first(where: { $0.value == id })?.key.capitalized ?? "Unknown"
     }
+}
+
+// Make Int identifiable for .sheet(item:)
+extension Int: @retroactive Identifiable {
+    public var id: Int { self }
 }
 
 // MARK: - Class Picker Sheet
@@ -294,10 +288,6 @@ struct ClassPickerSheet: View {
                         selection = cls.id; onDismiss(); dismiss()
                     } label: {
                         HStack {
-                            Circle()
-                                .fill(Color(hue: Double(cls.id * 37 % 360) / 360.0,
-                                            saturation: 0.8, brightness: 0.9))
-                                .frame(width: 10, height: 10)
                             Text(cls.name.capitalized).foregroundColor(.primary)
                             Spacer()
                             if selection == cls.id {
@@ -332,8 +322,7 @@ private struct LabeledSlider: View {
             Text(title).font(.caption).frame(width: 42, alignment: .leading)
             Slider(value: $value, in: range)
             Text(String(format: format, value))
-                .font(.caption2)
-                .monospacedDigit()
+                .font(.caption2).monospacedDigit()
                 .frame(width: 46, alignment: .trailing)
         }
     }

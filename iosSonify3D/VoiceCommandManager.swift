@@ -3,7 +3,6 @@ import Speech
 import AVFoundation
 import Combine
 
-/// Maps COCO class names to YOLOv8 class IDs (0-79)
 let cocoClasses: [String: Int] = [
     "person": 0, "bicycle": 1, "car": 2, "motorcycle": 3, "airplane": 4,
     "bus": 5, "train": 6, "truck": 7, "boat": 8, "traffic light": 9,
@@ -35,7 +34,6 @@ private let classAliases: [String: String] = [
     "bike": "bicycle", "motorbike": "motorcycle"
 ]
 
-/// Resolve a spoken name to a COCO class ID. Exact match first, then alias, then partial.
 func resolveCocoClass(_ input: String) -> (name: String, id: Int)? {
     let cleaned = input.trimmingCharacters(in: .punctuationCharacters).lowercased()
     if let id = cocoClasses[cleaned] { return (cleaned, id) }
@@ -61,12 +59,13 @@ func resolveCocoClass(_ input: String) -> (name: String, id: Int)? {
 
 final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate {
 
-    @Published var activeClasses: [(name: String, classId: Int)] = []
     @Published var statusText: String = "Tap mic to listen"
     @Published var isListening: Bool = false
     @Published var sweepRateMultiplier: Float = 1.0
 
-    var onClassesChanged: (([Int]) -> Void)?
+    /// Callbacks — slot-based
+    var onSlotChanged: ((Int, Int) -> Void)?    // (slot, classId)
+    var onClearAll: (() -> Void)?
     var onSweepRateChanged: ((Float) -> Void)?
     var onScanTriggered: (() -> Void)?
 
@@ -77,7 +76,14 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
     private let synthesizer = AVSpeechSynthesizer()
 
     private var executedCommands: Set<String> = []
-    static let maxActiveClasses = 2
+
+    // Map spoken numbers to slot indices
+    private static let numberWords: [(String, Int)] = [
+        ("1", 0), ("one", 0), ("won", 0),
+        ("2", 1), ("two", 1), ("to", 1), ("too", 1),
+        ("3", 2), ("three", 2), ("tree", 2),
+        ("4", 3), ("four", 3), ("for", 3), ("fore", 3)
+    ]
 
     override init() {
         super.init()
@@ -99,8 +105,7 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
             statusText = "Recognizer unavailable"; return
         }
 
-        recognitionTask?.cancel()
-        recognitionTask = nil
+        recognitionTask?.cancel(); recognitionTask = nil
         executedCommands.removeAll()
 
         let audioSession = AVAudioSession.sharedInstance()
@@ -136,14 +141,12 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
 
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
             guard let self else { return }
-
             if let result = result {
                 let fullText = result.bestTranscription.formattedString.lowercased()
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 print("[Voice] Transcript: '\(fullText)'")
                 self.processFullTranscript(fullText)
             }
-
             if error != nil || (result?.isFinal ?? false) {
                 self.audioEngine.inputNode.removeTap(onBus: 0)
                 self.audioEngine.stop()
@@ -157,8 +160,7 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
             }
         }
 
-        isListening = true
-        statusText = "Listening…"
+        isListening = true; statusText = "Listening…"
     }
 
     func stopListening() {
@@ -167,8 +169,7 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
         audioEngine.stop()
         recognitionRequest?.endAudio()
         recognitionTask?.cancel()
-        recognitionRequest = nil
-        recognitionTask = nil
+        recognitionRequest = nil; recognitionTask = nil
         statusText = "Tap mic to listen"
         executedCommands.removeAll()
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
@@ -177,23 +178,20 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
     private func processFullTranscript(_ text: String) {
         guard !text.isEmpty else { return }
 
-        // "scan" / "go" — trigger a scan
+        // "scan" / "go"
         if (text.hasSuffix("scan") || text.hasSuffix("go") || text == "scan" || text == "go")
             && !executedCommands.contains("scan:\(text.count)") {
             executedCommands.insert("scan:\(text.count)")
             onScanTriggered?()
-            speak("Scanning")
-            statusText = "Scanning…"
-            print("[Voice] → scan triggered")
-            return
+            speak("Scanning"); statusText = "Scanning…"
+            print("[Voice] → scan"); return
         }
 
         // "clear" / "reset"
         if (text.contains("clear") || text.contains("reset"))
             && !executedCommands.contains("clear") {
             executedCommands.insert("clear")
-            activeClasses.removeAll()
-            notifyClassChange()
+            onClearAll?()
             speak("Cleared"); statusText = "Cleared"
             print("[Voice] → clear"); return
         }
@@ -214,34 +212,40 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
             speak("Faster"); print("[Voice] → faster"); return
         }
 
-        // "target 2 [object]" or "target two [object]"
-        let t2Patterns = ["target 2 ", "target two ", "target to "]
-        for pat in t2Patterns {
-            if let range = text.range(of: pat) {
-                let after = String(text[range.upperBound...])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                let objName = extractObjectName(after)
-                let cmdKey = "target2:\(objName)"
-                if !objName.isEmpty && !executedCommands.contains(cmdKey) {
-                    if let resolved = resolveCocoClass(objName) {
-                        executedCommands.insert(cmdKey)
-                        if activeClasses.count < 2 {
-                            activeClasses.append((name: resolved.name, classId: resolved.id))
-                        } else {
-                            activeClasses[1] = (name: resolved.name, classId: resolved.id)
-                        }
-                        notifyClassChange()
-                        speak("Target 2 \(resolved.name)")
-                        statusText = "Finding: " + activeClasses.map { $0.name }
-                            .joined(separator: " + ")
-                        print("[Voice] → target 2 \(resolved.name) (id \(resolved.id))")
-                    }
-                }
+        // "target N [object]" — assign to slot N
+        if let range = text.range(of: "target ") {
+            let after = String(text[range.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let afterWords = after.split(separator: " ").map { String($0) }
+            guard afterWords.count >= 2 else { return }
+
+            // First word should be a number
+            let numWord = afterWords[0]
+            var slot: Int? = nil
+            for (word, idx) in Self.numberWords {
+                if numWord == word { slot = idx; break }
+            }
+            guard let resolvedSlot = slot else {
+                // No number — might be "find" style, fall through
                 return
             }
+
+            let objText = afterWords.dropFirst().joined(separator: " ")
+            let objName = extractObjectName(objText)
+            let cmdKey = "target\(resolvedSlot):\(objName)"
+            if !objName.isEmpty && !executedCommands.contains(cmdKey) {
+                if let resolved = resolveCocoClass(objName) {
+                    executedCommands.insert(cmdKey)
+                    onSlotChanged?(resolvedSlot, resolved.id)
+                    speak("Target \(resolvedSlot + 1) \(resolved.name)")
+                    statusText = "Slot \(resolvedSlot + 1): \(resolved.name)"
+                    print("[Voice] → target \(resolvedSlot + 1) \(resolved.name) (id \(resolved.id))")
+                }
+            }
+            return
         }
 
-        // "find [object]"
+        // "find [object]" → slot 0
         if let range = text.range(of: "find ") {
             let after = String(text[range.upperBound...])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -250,60 +254,29 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
             if !objName.isEmpty && !executedCommands.contains(cmdKey) {
                 if let resolved = resolveCocoClass(objName) {
                     executedCommands.insert(cmdKey)
-                    setAsTarget(slot: 0, name: resolved.name, classId: resolved.id)
+                    onSlotChanged?(0, resolved.id)
                     speak("Finding \(resolved.name)")
-                    print("[Voice] → find \(resolved.name) (id \(resolved.id))")
+                    statusText = "Slot 1: \(resolved.name)"
+                    print("[Voice] → find \(resolved.name) → slot 0")
                 }
             }
             return
         }
 
-        // "also [object]"
-        if let range = text.range(of: "also ") {
-            let after = String(text[range.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let objName = extractObjectName(after)
-            let cmdKey = "also:\(objName)"
-            if !objName.isEmpty && !executedCommands.contains(cmdKey) {
-                if let resolved = resolveCocoClass(objName) {
-                    executedCommands.insert(cmdKey)
-                    if activeClasses.count < Self.maxActiveClasses &&
-                       !activeClasses.contains(where: { $0.classId == resolved.id }) {
-                        activeClasses.append((name: resolved.name, classId: resolved.id))
-                    } else if activeClasses.count >= Self.maxActiveClasses {
-                        activeClasses[1] = (name: resolved.name, classId: resolved.id)
-                    }
-                    notifyClassChange()
-                    speak("Also \(resolved.name)")
-                    print("[Voice] → also \(resolved.name) (id \(resolved.id))")
-                }
-            }
-            return
-        }
-
-        // Bare object name → treat as "find"
+        // Bare object name → slot 0
         let words = text.split(separator: " ").map { String($0) }
         if let lastWord = words.last {
             let cmdKey = "bare:\(lastWord)"
             if !executedCommands.contains(cmdKey) {
                 if let resolved = resolveCocoClass(lastWord) {
                     executedCommands.insert(cmdKey)
-                    setAsTarget(slot: 0, name: resolved.name, classId: resolved.id)
+                    onSlotChanged?(0, resolved.id)
                     speak("Finding \(resolved.name)")
-                    print("[Voice] → bare word → find \(resolved.name) (id \(resolved.id))")
+                    statusText = "Slot 1: \(resolved.name)"
+                    print("[Voice] → bare → \(resolved.name) → slot 0")
                 }
             }
         }
-    }
-
-    private func setAsTarget(slot: Int, name: String, classId: Int) {
-        if activeClasses.isEmpty {
-            activeClasses.append((name: name, classId: classId))
-        } else {
-            activeClasses[min(slot, activeClasses.count - 1)] = (name: name, classId: classId)
-        }
-        notifyClassChange()
-        statusText = "Finding: " + activeClasses.map { $0.name }.joined(separator: " + ")
     }
 
     private func extractObjectName(_ text: String) -> String {
@@ -314,11 +287,6 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
             if resolveCocoClass(twoWord) != nil { return twoWord }
         }
         return words[0]
-    }
-
-    private func notifyClassChange() {
-        let ids = activeClasses.map { $0.classId }
-        onClassesChanged?(ids)
     }
 
     private func speak(_ text: String) {

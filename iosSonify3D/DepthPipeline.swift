@@ -36,14 +36,22 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     private var isDetectionRunning: Bool = false
 
     private var activeClassIds: Set<Int> = []
+    private var activeSlotMap: [Int: Int] = [:]   // classId → slot (0-3)
     private let activeClassLock = NSLock()
 
     // ─── Sweep state ───
     private var displayLink: CADisplayLink?
     private var sweepSeconds: Double = 2.0
     private var sweepStart = Date()
-    private var onColumn: ((Int, Int, Float, Float, Float, Float) -> Void)?
-    // Args: col, classId, centroid, coverage, depth, pan
+
+    /// Per-target hit: (slot, centroid, coverage, depth)
+    struct ColumnHit {
+        let slot: Int
+        let centroid: Float
+        let coverage: Float
+    }
+    private var onColumnMulti: ((Int, [ColumnHit], Float, Float) -> Void)?
+    // Args: col, hits[], depth, pan
 
     private var lastTime = Date()
     private var frameCount = 0
@@ -62,13 +70,14 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         sweepSeconds = seconds
     }
 
-    func setActiveClasses(_ ids: [Int]) {
+    func setActiveClasses(_ slotMap: [Int: Int]) {
         activeClassLock.lock()
-        activeClassIds = Set(ids)
+        activeSlotMap = slotMap
+        activeClassIds = Set(slotMap.keys)
         activeClassLock.unlock()
-        detector.setActiveClasses(ids)
+        detector.setActiveClasses(Array(slotMap.keys))
 
-        if ids.isEmpty {
+        if slotMap.isEmpty {
             gridLock.lock()
             classGrid = [UInt8](repeating: 0, count: Self.gridWidth * Self.gridHeight)
             gridLock.unlock()
@@ -79,15 +88,15 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     // MARK: - Triggered Scan
 
     /// Snapshot current depth + class grids, then sweep once through the snapshot.
-    /// onColumn args: col, classId, centroid, coverage, depth, pan
+    /// onColumn args: col, [ColumnHit], depth, pan
     func triggerScan(sweepSeconds: Double,
-                     onColumn: @escaping (Int, Int, Float, Float, Float, Float) -> Void,
+                     onColumn: @escaping (Int, [ColumnHit], Float, Float) -> Void,
                      onComplete: @escaping () -> Void) {
         // Already scanning? ignore
         guard !isScanning else { return }
 
         self.sweepSeconds = sweepSeconds
-        self.onColumn = onColumn
+        self.onColumnMulti = onColumn
 
         // Freeze snapshot
         gridLock.lock()
@@ -112,7 +121,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     func stopScan() {
         displayLink?.invalidate()
         displayLink = nil
-        onColumn = nil
+        onColumnMulti = nil
         DispatchQueue.main.async { self.isScanning = false }
     }
 
@@ -135,7 +144,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                 // Sweep complete
                 link.invalidate()
                 p.displayLink = nil
-                p.onColumn = nil
+                p.onColumnMulti = nil
                 DispatchQueue.main.async {
                     p.isScanning = false
                     p.scanColumn = 0
@@ -150,12 +159,23 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
             let col = Int(round(phase * maxCol))
             DispatchQueue.main.async { p.scanColumn = col }
 
-            // Read from SNAPSHOT (not live)
-            let (classId, centroid, coverage) = p.snapColumnTargetInfo(col: col)
+            // Read from SNAPSHOT — get ALL target hits in this column
+            let hits = p.snapColumnAllTargets(col: col)
             let z01 = p.snapColumnZ01(col: col)
             let pan = Float(Double(col) / maxCol * 2 - 1)
 
-            p.onColumn?(col, classId, centroid, coverage, z01, pan)
+            // Debug: log hits periodically
+            if !hits.isEmpty {
+                struct HitDbg { static var lastLog: Double = 0 }
+                let now2 = CACurrentMediaTime()
+                if now2 - HitDbg.lastLog > 0.5 {
+                    HitDbg.lastLog = now2
+                    let desc = hits.map { "s\($0.slot) cov=\(String(format:"%.2f",$0.coverage)) cen=\(String(format:"%.2f",$0.centroid))" }.joined(separator: ", ")
+                    print("[Sweep] col=\(col) hits: \(desc) z=\(String(format:"%.2f",z01))")
+                }
+            }
+
+            p.onColumnMulti?(col, hits, z01, pan)
 
             // Update debug image periodically
             let now = CACurrentMediaTime()
@@ -170,18 +190,18 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
 
     // MARK: - Snapshot column queries
 
-    /// Returns (classId, centroid01, coverage01) for the best target class in this column.
-    /// classId = -1 if no target detected.
-    private func snapColumnTargetInfo(col: Int) -> (Int, Float, Float) {
+    /// Returns hits for ALL active target classes found in this column.
+    private func snapColumnAllTargets(col: Int) -> [ColumnHit] {
         let W = Self.gridWidth, H = Self.gridHeight
 
         activeClassLock.lock()
+        let slotMap = activeSlotMap
         let targets = activeClassIds
         activeClassLock.unlock()
 
-        guard !targets.isEmpty else { return (-1, 0.5, 0) }
+        guard !targets.isEmpty else { return [] }
 
-        // Count target pixels in column
+        // Count pixels per target class in this column
         var classCounts: [Int: Int] = [:]
         for y in 0..<H {
             let val = Int(snapClass[y * W + col])
@@ -191,24 +211,28 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
             }
         }
 
-        guard !classCounts.isEmpty else { return (-1, 0.5, 0) }
+        guard !classCounts.isEmpty else { return [] }
 
-        let (bestId, bestCount) = classCounts.max(by: { $0.value < $1.value })!
-        let coverage = Float(bestCount) / Float(H)
+        var hits: [ColumnHit] = []
+        for (classId, count) in classCounts {
+            guard let slot = slotMap[classId] else { continue }
+            let coverage = Float(count) / Float(H)
 
-        // Compute Y centroid of the object mask in this column
-        var ws: Float = 0, tw: Float = 0
-        for y in 0..<H {
-            let val = Int(snapClass[y * W + col])
-            if val > 0 && (val - 1) == bestId {
-                let normY = Float(H - 1 - y) / Float(H - 1)  // bottom=0, top=1
-                ws += normY
-                tw += 1
+            // Compute Y centroid for this class in column
+            var ws: Float = 0, tw: Float = 0
+            for y in 0..<H {
+                let val = Int(snapClass[y * W + col])
+                if val > 0 && (val - 1) == classId {
+                    let normY = Float(H - 1 - y) / Float(H - 1)
+                    ws += normY; tw += 1
+                }
             }
-        }
-        let centroid = tw > 0 ? ws / tw : 0.5
+            let centroid = tw > 0 ? ws / tw : 0.5
 
-        return (bestId, centroid, coverage)
+            hits.append(ColumnHit(slot: slot, centroid: centroid, coverage: coverage))
+        }
+
+        return hits
     }
 
     /// Average normalized depth for this column from snapshot.
