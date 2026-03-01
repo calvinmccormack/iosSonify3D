@@ -13,41 +13,42 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     @Published var debugImage: UIImage?
     @Published var fps: Double = 0
     @Published var scanColumn: Int = 0
+    @Published var isScanning: Bool = false
     @Published var detectionStatusText: String = ""
 
     var nearMeters: Float = 0.30
     var farMeters: Float = 4.00
-    var gainRangeDB: Float = 24
 
     private let session = ARSession()
 
+    // ─── Live grids (updated every AR frame) ───
     private var grid = [Float](repeating: 0, count: gridWidth * gridHeight)
+    private var classGrid = [UInt8](repeating: 0, count: gridWidth * gridHeight)
     private let gridLock = NSLock()
+
+    // ─── Snapshot grids (frozen when scan triggers) ───
+    private var snapDepth = [Float](repeating: 0, count: gridWidth * gridHeight)
+    private var snapClass = [UInt8](repeating: 0, count: gridWidth * gridHeight)
 
     let detector = ObjectDetector()
     private var lastDetectionTime: TimeInterval = 0
-    private let detectionInterval: TimeInterval = 0.20  // slightly slower to reduce frame pressure
+    private let detectionInterval: TimeInterval = 0.20
     private var isDetectionRunning: Bool = false
-
-    private var classGrid = [UInt8](repeating: 0, count: gridWidth * gridHeight)
-    private var classGridVersion: UInt64 = 0
 
     private var activeClassIds: Set<Int> = []
     private let activeClassLock = NSLock()
 
+    // ─── Sweep state ───
     private var displayLink: CADisplayLink?
     private var sweepSeconds: Double = 2.0
     private var sweepStart = Date()
-
-    private var onColumn: ((Int, [Float], [Float], Int, Float, Float, Float) -> Void)?
+    private var onColumn: ((Int, Int, Float, Float, Float, Float) -> Void)?
+    // Args: col, classId, centroid, coverage, depth, pan
 
     private var lastTime = Date()
     private var frameCount = 0
-
     private var lastUIUpdateTime: TimeInterval = 0
     private let uiUpdateInterval: TimeInterval = 0.1
-    private var lastDebugPrintTime: TimeInterval = 0
-    private let debugPrintInterval: TimeInterval = 1.0
 
     func attach(to container: UIView) {
         let config = ARWorldTrackingConfiguration()
@@ -55,23 +56,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         config.environmentTexturing = .none
         session.delegate = self
         session.run(config)
-    }
-
-    func start(sweepSeconds: Double, onColumn: @escaping (Int, [Float], [Float], Int, Float, Float, Float) -> Void) {
-        self.onColumn = onColumn
-        self.sweepSeconds = sweepSeconds
-        self.sweepStart = Date()
-
-        displayLink?.invalidate()
-        let dl = CADisplayLink(target: self, selector: #selector(step))
-        dl.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
-        dl.add(to: .main, forMode: .common)
-        displayLink = dl
-    }
-
-    func stop() {
-        displayLink?.invalidate(); displayLink = nil
-        onColumn = nil
     }
 
     func setSweepRate(_ seconds: Double) {
@@ -87,95 +71,159 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         if ids.isEmpty {
             gridLock.lock()
             classGrid = [UInt8](repeating: 0, count: Self.gridWidth * Self.gridHeight)
-            classGridVersion += 1
             gridLock.unlock()
             DispatchQueue.main.async { self.detectionStatusText = "" }
         }
     }
 
-    @objc private func step() {
-        let t = -sweepStart.timeIntervalSinceNow
-        let period = max(0.2, sweepSeconds)
-        let phase = (t.truncatingRemainder(dividingBy: period) + period)
-                     .truncatingRemainder(dividingBy: period) / period
+    // MARK: - Triggered Scan
 
-        let maxCol = Double(Self.gridWidth - 1)
-        let col = Int(round(phase * maxCol))
-        scanColumn = col
+    /// Snapshot current depth + class grids, then sweep once through the snapshot.
+    /// onColumn args: col, classId, centroid, coverage, depth, pan
+    func triggerScan(sweepSeconds: Double,
+                     onColumn: @escaping (Int, Int, Float, Float, Float, Float) -> Void,
+                     onComplete: @escaping () -> Void) {
+        // Already scanning? ignore
+        guard !isScanning else { return }
 
-        let env = columnEnvelope(col: col)
-        let (targetMask, classId) = columnTargetMaskAndClass(col: col)
+        self.sweepSeconds = sweepSeconds
+        self.onColumn = onColumn
 
-        let norm = Double(col) / maxCol
-        let pan = Float(norm * 2 - 1)
+        // Freeze snapshot
+        gridLock.lock()
+        snapDepth = grid
+        snapClass = classGrid
+        gridLock.unlock()
 
-        var z01 = columnZ01(col: col)
-        let edge01 = columnEdge01(col: col)
+        print("[Scan] Snapshot taken. Sweep \(String(format: "%.1f", sweepSeconds))s")
 
-        let targetCov = columnTargetCoverage(col: col)
-        z01 = clamp01(z01 - targetCov * 0.3)
+        // Start sweep
+        sweepStart = Date()
+        DispatchQueue.main.async { self.isScanning = true }
 
-        // Debug: log when we have a detected object in the sweep
-        let maskSum = targetMask.reduce(0, +)
-        if classId > 0 || maskSum > 0 {
-            let now2 = CACurrentMediaTime()
-            if now2 - lastDebugPrintTime > debugPrintInterval {
-                lastDebugPrintTime = now2
-                print("[Sweep] col=\(col) classId=\(classId) maskSum=\(maskSum) coverage=\(String(format: "%.2f", targetCov))")
-            }
+        displayLink?.invalidate()
+        let dl = CADisplayLink(target: SweepTarget(pipeline: self, onComplete: onComplete),
+                               selector: #selector(SweepTarget.step))
+        dl.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+        dl.add(to: .main, forMode: .common)
+        displayLink = dl
+    }
+
+    func stopScan() {
+        displayLink?.invalidate()
+        displayLink = nil
+        onColumn = nil
+        DispatchQueue.main.async { self.isScanning = false }
+    }
+
+    /// Helper class so CADisplayLink target doesn't retain DepthPipeline strongly in a cycle
+    private class SweepTarget: NSObject {
+        weak var pipeline: DepthPipeline?
+        let onComplete: () -> Void
+
+        init(pipeline: DepthPipeline, onComplete: @escaping () -> Void) {
+            self.pipeline = pipeline
+            self.onComplete = onComplete
         }
 
-        onColumn?(col, env, targetMask, classId, pan, z01, edge01)
+        @objc func step(_ link: CADisplayLink) {
+            guard let p = pipeline else { link.invalidate(); return }
+            let t = -p.sweepStart.timeIntervalSinceNow
+            let period = max(0.2, p.sweepSeconds)
 
-        let now = CACurrentMediaTime()
-        if now - lastUIUpdateTime > uiUpdateInterval {
-            lastUIUpdateTime = now
-            if let img = debugImageFromGrid(highlightCol: col) {
-                DispatchQueue.main.async { self.debugImage = img }
+            if t >= period {
+                // Sweep complete
+                link.invalidate()
+                p.displayLink = nil
+                p.onColumn = nil
+                DispatchQueue.main.async {
+                    p.isScanning = false
+                    p.scanColumn = 0
+                }
+                print("[Scan] Complete")
+                onComplete()
+                return
+            }
+
+            let phase = t / period
+            let maxCol = Double(DepthPipeline.gridWidth - 1)
+            let col = Int(round(phase * maxCol))
+            DispatchQueue.main.async { p.scanColumn = col }
+
+            // Read from SNAPSHOT (not live)
+            let (classId, centroid, coverage) = p.snapColumnTargetInfo(col: col)
+            let z01 = p.snapColumnZ01(col: col)
+            let pan = Float(Double(col) / maxCol * 2 - 1)
+
+            p.onColumn?(col, classId, centroid, coverage, z01, pan)
+
+            // Update debug image periodically
+            let now = CACurrentMediaTime()
+            if now - p.lastUIUpdateTime > p.uiUpdateInterval {
+                p.lastUIUpdateTime = now
+                if let img = p.debugImageFromSnapshot(highlightCol: col) {
+                    DispatchQueue.main.async { p.debugImage = img }
+                }
             }
         }
     }
 
-    private func columnTargetMaskAndClass(col: Int, bands: Int = DepthPipeline.gridHeight) -> ([Float], Int) {
-        let W = Self.gridWidth
-        let H = Self.gridHeight
-        var mask = [Float](repeating: 0, count: bands)
+    // MARK: - Snapshot column queries
+
+    /// Returns (classId, centroid01, coverage01) for the best target class in this column.
+    /// classId = -1 if no target detected.
+    private func snapColumnTargetInfo(col: Int) -> (Int, Float, Float) {
+        let W = Self.gridWidth, H = Self.gridHeight
 
         activeClassLock.lock()
         let targets = activeClassIds
         activeClassLock.unlock()
 
-        guard !targets.isEmpty else { return (mask, -1) }
+        guard !targets.isEmpty else { return (-1, 0.5, 0) }
 
-        gridLock.lock(); defer { gridLock.unlock() }
-
+        // Count target pixels in column
         var classCounts: [Int: Int] = [:]
         for y in 0..<H {
-            let gridVal = Int(classGrid[y * W + col])
-            if gridVal > 0 {
-                let classId = gridVal - 1
-                if targets.contains(classId) {
-                    classCounts[classId, default: 0] += 1
-                }
+            let val = Int(snapClass[y * W + col])
+            if val > 0 {
+                let cid = val - 1
+                if targets.contains(cid) { classCounts[cid, default: 0] += 1 }
             }
         }
 
-        guard !classCounts.isEmpty else { return (mask, -1) }
+        guard !classCounts.isEmpty else { return (-1, 0.5, 0) }
 
-        let (bestClassId, _) = classCounts.max(by: { $0.value < $1.value })!
+        let (bestId, bestCount) = classCounts.max(by: { $0.value < $1.value })!
+        let coverage = Float(bestCount) / Float(H)
 
+        // Compute Y centroid of the object mask in this column
+        var ws: Float = 0, tw: Float = 0
         for y in 0..<H {
-            let gridVal = Int(classGrid[y * W + col])
-            if gridVal > 0 && (gridVal - 1) == bestClassId {
-                let rBand = (H - 1 - y)
-                if rBand >= 0 && rBand < bands { mask[rBand] = 1.0 }
+            let val = Int(snapClass[y * W + col])
+            if val > 0 && (val - 1) == bestId {
+                let normY = Float(H - 1 - y) / Float(H - 1)  // bottom=0, top=1
+                ws += normY
+                tw += 1
             }
         }
+        let centroid = tw > 0 ? ws / tw : 0.5
 
-        return (mask, bestClassId)
+        return (bestId, centroid, coverage)
     }
 
-    // MARK: ARSessionDelegate
+    /// Average normalized depth for this column from snapshot.
+    private func snapColumnZ01(col: Int) -> Float {
+        let W = Self.gridWidth, H = Self.gridHeight
+        let range = max(0.001, farMeters - nearMeters)
+        var acc: Float = 0
+        for y in 0..<H {
+            let d = snapDepth[y * W + col]
+            acc += max(0, min(1, (d - nearMeters) / range))
+        }
+        return acc / Float(H)
+    }
+
+    // MARK: - ARSessionDelegate (runs continuously for live preview + YOLO)
 
     private func handleFrame(_ frame: ARFrame) {
         guard let depthPB = frame.sceneDepth?.depthMap else { return }
@@ -184,7 +232,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         let nowTime = frame.timestamp
         if nowTime - lastDetectionTime > detectionInterval && !isDetectionRunning {
             lastDetectionTime = nowTime
-            // Pass capturedImage directly — do NOT hold a reference to frame
             let pixelBuffer = frame.capturedImage
             runDetection(pixelBuffer: pixelBuffer)
         }
@@ -196,6 +243,17 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
             fps = Double(frameCount) / dt
             frameCount = 0
             lastTime = now
+        }
+
+        // Update debug image from live data when NOT scanning
+        if !isScanning {
+            let nowCA = CACurrentMediaTime()
+            if nowCA - lastUIUpdateTime > uiUpdateInterval {
+                lastUIUpdateTime = nowCA
+                if let img = debugImageFromLive(highlightCol: nil) {
+                    DispatchQueue.main.async { self.debugImage = img }
+                }
+            }
         }
     }
 
@@ -213,26 +271,24 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         guard !isDetectionRunning else { return }
         isDetectionRunning = true
 
-        detector.detect(pixelBuffer: pixelBuffer, gridWidth: Self.gridWidth, gridHeight: Self.gridHeight) { [weak self] classGridResult, detections in
+        detector.detect(pixelBuffer: pixelBuffer, gridWidth: Self.gridWidth,
+                        gridHeight: Self.gridHeight) { [weak self] classGridResult, detections in
             guard let self else { return }
             defer { self.isDetectionRunning = false }
 
             if let newGrid = classGridResult {
                 self.gridLock.lock()
                 self.classGrid = newGrid
-                self.classGridVersion += 1
                 self.gridLock.unlock()
             } else {
                 self.gridLock.lock()
                 self.classGrid = [UInt8](repeating: 0, count: Self.gridWidth * Self.gridHeight)
-                self.classGridVersion += 1
                 self.gridLock.unlock()
             }
 
-            let summary = detections?.map { "\($0.className) \(Int($0.confidence * 100))%" }.joined(separator: ", ") ?? ""
-            DispatchQueue.main.async {
-                self.detectionStatusText = summary
-            }
+            let summary = detections?.map { "\($0.className) \(Int($0.confidence * 100))%" }
+                .joined(separator: ", ") ?? ""
+            DispatchQueue.main.async { self.detectionStatusText = summary }
         }
     }
 
@@ -266,69 +322,35 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
-    func columnEnvelope(col: Int) -> [Float] {
-        gridLock.lock(); defer { gridLock.unlock() }
-        var env = [Float](repeating: 1, count: Self.gridHeight)
-        for r in 0..<Self.gridHeight {
-            let gy = (Self.gridHeight - 1 - r)
-            let d = grid[gy * Self.gridWidth + col]
-            let t = clamp01(1 - (d - nearMeters) / max(0.001, (farMeters - nearMeters)))
-            env[r] = pow(10.0, ((0.0 as Float) - gainRangeDB * (1 - t)) / 20.0)
-        }
-        smoothInPlace(&env, a: 0.6)
-        return env
+    // MARK: - Debug images
+
+    private func debugImageFromSnapshot(highlightCol: Int) -> UIImage? {
+        return renderDebugImage(depthData: snapDepth, classData: snapClass, highlightCol: highlightCol)
     }
 
-    private func columnTargetCoverage(col: Int) -> Float {
-        let W = Self.gridWidth, H = Self.gridHeight
-        gridLock.lock(); defer { gridLock.unlock() }
-        var count = 0
-        for y in 0..<H { if classGrid[y * W + col] != 0 { count += 1 } }
-        return Float(count) / Float(H)
+    private func debugImageFromLive(highlightCol: Int?) -> UIImage? {
+        gridLock.lock()
+        let d = grid
+        let c = classGrid
+        gridLock.unlock()
+        return renderDebugImage(depthData: d, classData: c, highlightCol: highlightCol)
     }
 
-    private func columnZ01(col: Int) -> Float {
-        let W = Self.gridWidth, H = Self.gridHeight
-        gridLock.lock(); defer { gridLock.unlock() }
-        var acc: Float = 0; let range = max(0.001, (farMeters - nearMeters))
-        for y in 0..<H { acc += clamp01((grid[y * W + col] - nearMeters) / range) }
-        return acc / Float(H)
-    }
-
-    private func columnEdge01(col: Int) -> Float {
-        let W = Self.gridWidth, H = Self.gridHeight
-        let c1 = min(W - 1, col + 1)
-        gridLock.lock(); defer { gridLock.unlock() }
-        var acc: Float = 0
-        for y in 0..<H { acc += abs(grid[y * W + c1] - grid[y * W + col]) }
-        let norm = (acc / Float(H)) / max(0.001, (farMeters - nearMeters))
-        return clamp01(norm * 4)
-    }
-
-    private func smoothInPlace(_ x: inout [Float], a: Float) {
-        guard x.count > 1 else { return }
-        var prev = x[0]
-        for i in 1..<x.count { prev = a * prev + (1 - a) * x[i]; x[i] = prev }
-        prev = x.last ?? 0
-        for i in (0..<(x.count-1)).reversed() { prev = a * prev + (1 - a) * x[i]; x[i] = prev }
-    }
-
-    private func debugImageFromGrid(highlightCol: Int) -> UIImage? {
+    private func renderDebugImage(depthData: [Float], classData: [UInt8], highlightCol: Int?) -> UIImage? {
         let W = Self.gridWidth, H = Self.gridHeight
         var rgba = [UInt8](repeating: 0, count: W * H * 4)
+        let range = max(0.001, farMeters - nearMeters)
 
-        gridLock.lock()
-        let range = max(0.001, (farMeters - nearMeters))
         for y in 0..<H {
             for x in 0..<W {
                 let idx = y * W + x
-                let d = grid[idx]
-                let t = clamp01(1 - (d - nearMeters) / range)
+                let d = depthData[idx]
+                let t = max(0, min(1, 1 - (d - nearMeters) / range))
                 let gray = UInt8(t * 255)
-                let cls = classGrid[idx]
+                let cls = classData[idx]
                 let base = idx * 4
 
-                if x == highlightCol {
+                if let hc = highlightCol, x == hc {
                     rgba[base] = 255; rgba[base+1] = 0; rgba[base+2] = 0; rgba[base+3] = 255
                 } else if cls == 0 {
                     rgba[base] = gray; rgba[base+1] = gray; rgba[base+2] = gray; rgba[base+3] = 255
@@ -344,7 +366,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                 }
             }
         }
-        gridLock.unlock()
 
         let bytesPerRow = W * 4
         let cfData = CFDataCreate(nil, rgba, rgba.count)!
@@ -370,5 +391,3 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         return (r+m, g+m, b+m)
     }
 }
-
-@inline(__always) private func clamp01(_ x: Float) -> Float { max(0, min(1, x)) }

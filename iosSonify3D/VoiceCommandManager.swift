@@ -38,18 +38,15 @@ private let classAliases: [String: String] = [
 /// Resolve a spoken name to a COCO class ID. Exact match first, then alias, then partial.
 func resolveCocoClass(_ input: String) -> (name: String, id: Int)? {
     let cleaned = input.trimmingCharacters(in: .punctuationCharacters).lowercased()
-    // 1. Exact match
     if let id = cocoClasses[cleaned] { return (cleaned, id) }
-    // 2. Alias match
-    if let canonical = classAliases[cleaned], let id = cocoClasses[canonical] { return (canonical, id) }
-    // 3. Partial match — only if query is 3+ chars to avoid false positives
+    if let canonical = classAliases[cleaned], let id = cocoClasses[canonical] {
+        return (canonical, id)
+    }
     if cleaned.count >= 3 {
-        // Prefer exact word containment over substring
         for (className, classId) in cocoClasses {
             if className == cleaned { return (className, classId) }
         }
         for (className, classId) in cocoClasses {
-            // Only match if query IS the classname or classname IS the query (full word)
             let classWords = className.split(separator: " ").map { String($0) }
             let queryWords = cleaned.split(separator: " ").map { String($0) }
             for cw in classWords {
@@ -71,6 +68,7 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
 
     var onClassesChanged: (([Int]) -> Void)?
     var onSweepRateChanged: ((Float) -> Void)?
+    var onScanTriggered: (() -> Void)?
 
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -179,8 +177,20 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
     private func processFullTranscript(_ text: String) {
         guard !text.isEmpty else { return }
 
+        // "scan" / "go" — trigger a scan
+        if (text.hasSuffix("scan") || text.hasSuffix("go") || text == "scan" || text == "go")
+            && !executedCommands.contains("scan:\(text.count)") {
+            executedCommands.insert("scan:\(text.count)")
+            onScanTriggered?()
+            speak("Scanning")
+            statusText = "Scanning…"
+            print("[Voice] → scan triggered")
+            return
+        }
+
         // "clear" / "reset"
-        if (text.contains("clear") || text.contains("reset")) && !executedCommands.contains("clear") {
+        if (text.contains("clear") || text.contains("reset"))
+            && !executedCommands.contains("clear") {
             executedCommands.insert("clear")
             activeClasses.removeAll()
             notifyClassChange()
@@ -208,13 +218,13 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
         let t2Patterns = ["target 2 ", "target two ", "target to "]
         for pat in t2Patterns {
             if let range = text.range(of: pat) {
-                let after = String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let after = String(text[range.upperBound...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 let objName = extractObjectName(after)
                 let cmdKey = "target2:\(objName)"
                 if !objName.isEmpty && !executedCommands.contains(cmdKey) {
                     if let resolved = resolveCocoClass(objName) {
                         executedCommands.insert(cmdKey)
-                        // Add as second target
                         if activeClasses.count < 2 {
                             activeClasses.append((name: resolved.name, classId: resolved.id))
                         } else {
@@ -222,7 +232,8 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
                         }
                         notifyClassChange()
                         speak("Target 2 \(resolved.name)")
-                        statusText = "Finding: " + activeClasses.map { $0.name }.joined(separator: " + ")
+                        statusText = "Finding: " + activeClasses.map { $0.name }
+                            .joined(separator: " + ")
                         print("[Voice] → target 2 \(resolved.name) (id \(resolved.id))")
                     }
                 }
@@ -232,7 +243,8 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
 
         // "find [object]"
         if let range = text.range(of: "find ") {
-            let after = String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let after = String(text[range.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             let objName = extractObjectName(after)
             let cmdKey = "find:\(objName)"
             if !objName.isEmpty && !executedCommands.contains(cmdKey) {
@@ -248,7 +260,8 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
 
         // "also [object]"
         if let range = text.range(of: "also ") {
-            let after = String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let after = String(text[range.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             let objName = extractObjectName(after)
             let cmdKey = "also:\(objName)"
             if !objName.isEmpty && !executedCommands.contains(cmdKey) {
@@ -268,7 +281,7 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
             return
         }
 
-        // Bare object name (no "find"/"also" prefix) — treat as "find"
+        // Bare object name → treat as "find"
         let words = text.split(separator: " ").map { String($0) }
         if let lastWord = words.last {
             let cmdKey = "bare:\(lastWord)"
@@ -316,7 +329,8 @@ final class VoiceCommandManager: NSObject, ObservableObject, SFSpeechRecognizerD
         synthesizer.speak(utterance)
     }
 
-    func speechRecognizer(_ speechRecognizer: SFSpeechRecognizer, availabilityDidChange available: Bool) {
+    func speechRecognizer(_ speechRecognizer: SFSpeechRecognizer,
+                          availabilityDidChange available: Bool) {
         if !available { statusText = "Recognizer unavailable" }
     }
 }
